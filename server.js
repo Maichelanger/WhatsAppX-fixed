@@ -58,6 +58,15 @@ let queueClients = [];
 let presences = {};
 let reInitializeCount = 1;
 
+// Caché de nombres: número (sin @c.us) → nombre para mostrar.
+// Se rellena al arrancar y se actualiza pasivamente con cada mensaje nuevo.
+// No bloquea ninguna petición ni hace llamadas adicionales por mensaje.
+const contactNameCache = new Map();
+
+function getDisplayName(number) {
+    return contactNameCache.get(number) || number || "";
+}
+
 const client = new Client({
     puppeteer: {
         headless: true,
@@ -127,6 +136,29 @@ async function processMessageForCaption(message) {
         message.body = message._data.caption;
         message._data.caption = undefined;
     }
+
+    // Resolver nombre del autor para mostrar en burbujas de grupo.
+    // La app iOS lee el autor desde id.participant.user y desde el campo "author".
+    if (message.author) {
+        const fullAuthorId = message.author; // puede ser @c.us o @lid — nunca lo reconstruyas
+        const authorNum = fullAuthorId.split("@")[0];
+        const authorServer = fullAuthorId.split("@")[1] || "c.us";
+        const notifyName = (message._data && message._data.notifyName) ? message._data.notifyName : "";
+        const resolvedName = contactNameCache.get(fullAuthorId) || notifyName || authorNum;
+
+        message.authorNum = authorNum;
+        message.authorName = resolvedName;
+        message.author = resolvedName;
+
+        if (message.id && typeof message.id === "object") {
+            message.id.participant = {
+                user: authorNum,
+                server: authorServer,
+                _serialized: fullAuthorId
+            };
+        }
+    }
+
     return message;
 }
 
@@ -260,19 +292,30 @@ function setupWhatsAppEventListeners(socket) {
     client.setMaxListeners(16);
 
     client.on("message", async (message) => {
+        // En mensajes en tiempo real, notifyName SÍ está disponible.
+        if (message.author && message._data && message._data.notifyName) {
+            contactNameCache.set(message.author, message._data.notifyName);
+        }
+
         if (message.broadcast === true) {
             socket.write(JSON.stringify({
                 sender: "wspl-server",
                 response: "NEW_BROADCAST_NOTI"
             }));
         } else {
+            const evtAuthorNum = message.author ? message.author.split("@")[0] : "";
+            const evtNotify = (message._data && message._data.notifyName) ? message._data.notifyName : "";
+            const evtName = (message.author && contactNameCache.get(message.author)) || evtNotify || evtAuthorNum;
+
             socket.write(JSON.stringify({
                 sender: "wspl-server",
                 response: "NEW_MESSAGE_NOTI",
                 body: {
                     msgBody: message.body,
                     from: message.from.split("@")[0],
-                    author: message.author ? message.author.split("@")[0] : "",
+                    author: evtName,
+                    authorNum: evtAuthorNum,
+                    authorName: evtName,
                     type: message.type
                 }
             }));
@@ -355,6 +398,51 @@ client.on("ready", async () => {
     } catch (e) {
         console.error(`[ready] client.getChats() threw immediately after ready: ${e.message}`);
     }
+
+    // Rellenar caché de nombres en background — no bloquea nada
+    client.getContacts().then(contacts => {
+        let count = 0;
+        for (const c of contacts) {
+            if (!c.id || !c.id._serialized) continue;
+            const name = c.name || c.pushname || "";
+            if (name) {
+                contactNameCache.set(c.id._serialized, name);
+                count++;
+            }
+        }
+        console.log(`[Cache] ${count} nombres de contacto listos.`);
+
+        // Segunda pasada: resolver autores de grupo que no están en la agenda.
+        // IMPORTANTE: usamos el id COMPLETO de author (puede ser @c.us o @lid),
+        // nunca solo el número — reconstruir "numero@c.us" a partir de un id
+        // @lid produce un contacto inexistente, ya que el número de LID no es
+        // el número de teléfono real del contacto.
+        client.getChats().then(async chats => {
+            const groups = chats.filter(c => c.isGroup);
+            const unknownAuthors = new Set();
+            for (const group of groups) {
+                let msgs;
+                try { msgs = await group.fetchMessages({ limit: 50 }); }
+                catch (_) { continue; }
+                for (const m of msgs) {
+                    if (!m.author) continue;
+                    if (!contactNameCache.has(m.author)) unknownAuthors.add(m.author);
+                }
+            }
+            let added = 0;
+            for (const fullAuthorId of unknownAuthors) {
+                try {
+                    const contact = await client.getContactById(fullAuthorId);
+                    const name = contact?.name || contact?.pushname || "";
+                    if (name) { contactNameCache.set(fullAuthorId, name); added++; }
+                } catch (_) { /* ignorar */ }
+            }
+            console.log(`[Cache] ${added} autores de grupo resueltos (de ${unknownAuthors.size} únicos).`);
+        }).catch(e => console.error("[Cache] Error en warm-up de grupos:", e.message));
+
+    }).catch(err => {
+        console.error("[Cache] Error cargando contactos:", err.message);
+    });
 });
 
 client.on("disconnected", (reason) => {
@@ -527,6 +615,30 @@ app.all("/getContacts", async (req, res) => {
                 isMyContact: false,
                 isBlocked: false,
                 formattedNumber: client.info.wid.user,
+            });
+        }
+
+        // Inyectar números del caché que no estaban en la agenda (autores de grupo
+        // resueltos por notifyName/getContactById) para que la app los encuentre
+        // en contactList con isMyContact=true y muestre su nombre real.
+        const existingIds = new Set(contactList.map(c => c.id?._serialized));
+        for (const [fullId, name] of contactNameCache.entries()) {
+            if (existingIds.has(fullId)) continue;
+            if (!fullId.includes("@")) continue; // entradas antiguas/legado sin dominio — ignorar
+            existingIds.add(fullId);
+            const [num, server] = fullId.split("@");
+            const shortName = name.split(" ")[0] || name;
+            contactList.push({
+                id: { _serialized: fullId, server: server, user: num },
+                number: num,
+                name: String(name),
+                shortName: String(shortName),
+                pushname: String(name),
+                isMyContact: true,
+                isWAContact: true,
+                isBlocked: false,
+                isMe: false,
+                formattedNumber: num
             });
         }
 
