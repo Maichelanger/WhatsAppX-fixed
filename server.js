@@ -58,15 +58,6 @@ let queueClients = [];
 let presences = {};
 let reInitializeCount = 1;
 
-// Caché de nombres: número (sin @c.us) → nombre para mostrar.
-// Se rellena al arrancar y se actualiza pasivamente con cada mensaje nuevo.
-// No bloquea ninguna petición ni hace llamadas adicionales por mensaje.
-const contactNameCache = new Map();
-
-function getDisplayName(number) {
-    return contactNameCache.get(number) || number || "";
-}
-
 const client = new Client({
     puppeteer: {
         headless: true,
@@ -292,6 +283,10 @@ function setupWhatsAppEventListeners(socket) {
     client.setMaxListeners(16);
 
     client.on("message", async (message) => {
+        chatsCache.delete("all");
+        messagesCache.delete(`${message.from}:100`);
+        messagesCache.delete(`${message.from}:4294967295`);
+
         // En mensajes en tiempo real, notifyName SÍ está disponible.
         if (message.author && message._data && message._data.notifyName) {
             contactNameCache.set(message.author, message._data.notifyName);
@@ -349,6 +344,7 @@ function setupWhatsAppEventListeners(socket) {
     });
 
     client.on("group_join", async (notification) => {
+        chatsCache.delete("all");
         socket.write(JSON.stringify({
             sender: "wspl-server",
             response: "NEW_MESSAGE"
@@ -356,6 +352,7 @@ function setupWhatsAppEventListeners(socket) {
     });
 
     client.on("group_update", async (notification) => {
+        chatsCache.delete("all");
         socket.write(JSON.stringify({
             sender: "wspl-server",
             response: "NEW_MESSAGE"
@@ -476,12 +473,83 @@ app.get("/qr", async (req, res) => {
 
 let inFlightGetChats = null;
 
+// --- Lightweight caching + concurrency control (no new dependencies) ---
+
+// Simple TTL cache: cache.get(key) returns {data, timestamp} or undefined.
+function makeTTLCache() {
+    const store = new Map();
+    return {
+        get(key, ttlMs) {
+            const entry = store.get(key);
+            if (!entry) return undefined;
+            if (Date.now() - entry.timestamp > ttlMs) {
+                store.delete(key);
+                return undefined;
+            }
+            return entry.data;
+        },
+        set(key, data) {
+            store.set(key, { data, timestamp: Date.now() });
+        },
+        delete(key) {
+            store.delete(key);
+        },
+        clear() {
+            store.clear();
+        },
+    };
+}
+
+const chatsCache = makeTTLCache();
+const contactsCache = makeTTLCache();
+const messagesCache = makeTTLCache();
+
+// Caché de nombres: id completo (@c.us o @lid) → nombre para mostrar en
+// burbujas de grupo. Se rellena al arrancar y se actualiza pasivamente con
+// cada mensaje nuevo. No bloquea ninguna petición ni hace llamadas
+// adicionales por mensaje.
+const contactNameCache = new Map();
+
+const CHATS_CACHE_TTL = 20 * 1000;        // chat list changes often — short TTL
+const CONTACTS_CACHE_TTL = 5 * 60 * 1000; // contacts rarely change — longer TTL
+const MESSAGES_CACHE_TTL = 15 * 1000;     // avoid instant re-fetch on rapid re-open
+
+// Run async tasks with a concurrency cap instead of firing everything via
+// Promise.all at once — important once you have thousands of contacts/chats,
+// since Puppeteer's page is single-threaded and unbounded parallel evaluate()
+// calls just queue up and contend with each other anyway.
+async function runWithConcurrencyLimit(items, limit, worker) {
+    const results = new Array(items.length);
+    let nextIndex = 0;
+
+    async function runNext() {
+        while (nextIndex < items.length) {
+            const i = nextIndex++;
+            try {
+                results[i] = await worker(items[i], i);
+            } catch (err) {
+                results[i] = undefined;
+            }
+        }
+    }
+
+    const runners = Array.from({ length: Math.min(limit, items.length) }, runNext);
+    await Promise.all(runners);
+    return results;
+}
+
 app.all("/getChats", async (req, res) => {
     console.log(`[getChats] Request received at ${new Date().toISOString()}`);
 
     if (!global.loggedin) {
         console.log(`[getChats] Rejected — client not ready yet (global.loggedin is falsy).`);
         return res.status(503).send("Client not ready yet");
+    }
+
+    const cached = chatsCache.get("all", CHATS_CACHE_TTL);
+    if (cached) {
+        console.log(`[getChats] Serving from cache (age < ${CHATS_CACHE_TTL}ms).`);
+        return res.json(cached);
     }
 
     if (inFlightGetChats) {
@@ -509,30 +577,21 @@ app.all("/getChats", async (req, res) => {
         const chatList = await Promise.all(chatsWithMessages.map(processLastMessageCaption));
         console.log(`[getChats] Processed captions for ${chatList.length} chats`);
 
-        const groupChats = chatList.filter(chat => chat.isGroup);
-        console.log(`[getChats] Resolving full chat data for ${groupChats.length} group chats`);
-
-        const groupListPromises = groupChats.map(async (chat) => {
-            const groupId = chat.id._serialized;
-            const start = Date.now();
-            try {
-                const fullChat = await Promise.race([
-                    client.getChatById(groupId),
-                    timeout(45000, `getChatById(${groupId})`),
-                ]);
-                console.log(`[getChats] Group ${groupId} resolved in ${Date.now() - start}ms`);
-                if (fullChat) fullChat.groupDesc = fullChat.description;
-                return fullChat;
-            } catch (error) {
-                console.error(`[getChats] Group ${groupId} FAILED after ${Date.now() - start}ms: ${error.message}`);
-                return null;
-            }
+        // groupMetadata/description are already fully resolved for every
+        // group inside client.getChats() itself (getChatModel does this
+        // during the bulk pass), so there is no need to call getChatById
+        // again per group here — that was doing the same expensive
+        // resolution work a second time for every single group.
+        const groupList = chatList.filter(chat => chat.isGroup).map(chat => {
+            chat.groupDesc = chat.description;
+            return chat;
         });
-
-        const groupList = (await Promise.all(groupListPromises)).filter(Boolean);
+        console.log(`[getChats] ${groupList.length} group chats included (no redundant re-fetch).`);
         console.log(`[getChats] Done. Sending response.`);
 
-        return { chatList, groupList };
+        const result = { chatList, groupList };
+        chatsCache.set("all", result);
+        return result;
     })();
 
     inFlightGetChats.finally(() => { inFlightGetChats = null; }).catch(() => {});
@@ -573,6 +632,13 @@ app.all("/getBroadcasts", async (req, res) => {
 
 app.all("/getContacts", async (req, res) => {
     console.log(`[getContacts] Request received at ${new Date().toISOString()}`);
+
+    const cached = contactsCache.get("all", CONTACTS_CACHE_TTL);
+    if (cached) {
+        console.log(`[getContacts] Serving from cache (age < ${CONTACTS_CACHE_TTL}ms).`);
+        return res.json(cached);
+    }
+
     try {
         const allContacts = await client.getContacts();
         console.log(`[getContacts] client.getContacts() resolved with ${allContacts.length} total contacts`);
@@ -581,7 +647,12 @@ app.all("/getContacts", async (req, res) => {
         );
         console.log(`[getContacts] ${waContacts.length} passed the filter (isMe or isWAContact)`);
 
-        const contactListRaw = await Promise.all(waContacts.map(async (contact) => {
+        // Process with bounded concurrency instead of firing every contact's
+        // evaluate() at once — Puppeteer's page is single-threaded, so doing
+        // thousands simultaneously just makes them all queue and contend
+        // with each other anyway. A modest cap finishes faster in practice
+        // and keeps the browser responsive to other requests meanwhile.
+        const contactListRaw = await runWithConcurrencyLimit(waContacts, 8, async (contact) => {
             try {
                 if (contact.isMyContact === true && contact.isWAContact === true) {
                     const about = await contact.getAbout();
@@ -597,7 +668,7 @@ app.all("/getContacts", async (req, res) => {
                 contact.formattedNumber = contact.number;
                 return contact;
             }
-        }));
+        });
         const contactList = contactListRaw.filter(Boolean);
 
         if (!contactList.some(c => c.isMe)) {
@@ -618,30 +689,6 @@ app.all("/getContacts", async (req, res) => {
             });
         }
 
-        // Inyectar números del caché que no estaban en la agenda (autores de grupo
-        // resueltos por notifyName/getContactById) para que la app los encuentre
-        // en contactList con isMyContact=true y muestre su nombre real.
-        const existingIds = new Set(contactList.map(c => c.id?._serialized));
-        for (const [fullId, name] of contactNameCache.entries()) {
-            if (existingIds.has(fullId)) continue;
-            if (!fullId.includes("@")) continue; // entradas antiguas/legado sin dominio — ignorar
-            existingIds.add(fullId);
-            const [num, server] = fullId.split("@");
-            const shortName = name.split(" ")[0] || name;
-            contactList.push({
-                id: { _serialized: fullId, server: server, user: num },
-                number: num,
-                name: String(name),
-                shortName: String(shortName),
-                pushname: String(name),
-                isMyContact: true,
-                isWAContact: true,
-                isBlocked: false,
-                isMe: false,
-                formattedNumber: num
-            });
-        }
-
         contactList.sort((a, b) => {
             const nameA = (a.name || "").toLowerCase();
             const nameB = (b.name || "").toLowerCase();
@@ -651,7 +698,9 @@ app.all("/getContacts", async (req, res) => {
         });
 
         console.log(`[getContacts] Sending ${contactList.length} contacts. Has isMe: ${contactList.some(c => c.isMe)}`);
-        res.json({ contactList });
+        const result = { contactList };
+        contactsCache.set("all", result);
+        res.json(result);
     } catch (error) {
         console.error(`[getContacts] FAILED:`, error.message);
         res.status(500).send("Failed to get contacts: " + error.message);
@@ -761,22 +810,34 @@ app.all("/getGroupInfo/:id", async (req, res) => {
 app.all("/getChatMessages/:contactId", async (req, res) => {
     try {
         const contactId = buildContactId(req.params.contactId, req.query.isGroup == 1);
+        const limit = req.query.isLight == 1 ? 100 : 4294967295;
+        const cacheKey = `${contactId}:${limit}`;
+
+        const cached = messagesCache.get(cacheKey, MESSAGES_CACHE_TTL);
+        if (cached) {
+            console.log(`[getChatMessages] Serving ${contactId} from cache.`);
+            res.setHeader("Content-Type", "application/json");
+            return res.json(cached);
+        }
+
         const chat = await client.getChatById(contactId);
         if (!chat) {
             console.log("[getChatMessages] Chat not found/resolvable for:", contactId);
             return res.status(404).json({ error: "Chat not found" });
         }
-        const limit = req.query.isLight == 1 ? 100 : 4294967295;
         const messages = await chat.fetchMessages({ limit });
 
         const filteredMessages = messages.filter(message => message.type !== "notification_template");
         const processedMessages = await Promise.all(filteredMessages.map(processMessageForCaption));
 
-        res.setHeader("Content-Type", "application/json");
-        res.json({
+        const result = {
             chatMessages: processedMessages,
             fromNumber: contactId.split("@")[0]
-        });
+        };
+        messagesCache.set(cacheKey, result);
+
+        res.setHeader("Content-Type", "application/json");
+        res.json(result);
     } catch (error) {
         console.error("[getChatMessages] FAILED:", error.message);
         res.status(500).send(error.message);
