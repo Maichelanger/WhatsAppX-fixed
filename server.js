@@ -671,21 +671,61 @@ app.all("/getContacts", async (req, res) => {
         });
         const contactList = contactListRaw.filter(Boolean);
 
+        // Si no hay un contacto "isMe" en la colección, lo sintetizamos
+        // usando client.info. IMPORTANTE: client.info puede tardar un
+        // instante en poblarse completamente justo después de "ready" — si
+        // sintetizamos con datos incompletos (sin pushname) y ESE resultado
+        // se cachea, todo el mundo vería un perfil propio roto durante los
+        // próximos 5 minutos. Por eso: si client.info no está listo todavía,
+        // NO sintetizamos un placeholder roto y NO cacheamos esta respuesta,
+        // para que el siguiente intento (segundos después) lo reintente
+        // fresco en vez de quedar atascado con datos malos.
+        let skipCache = false;
         if (!contactList.some(c => c.isMe)) {
-            console.log("[getContacts] No 'isMe' contact found in collection — synthesizing one from client.info.");
+            const infoReady = client.info && client.info.wid && client.info.wid.user && client.info.pushname;
+            if (infoReady) {
+                console.log("[getContacts] No 'isMe' contact found in collection — synthesizing one from client.info.");
+                contactList.push({
+                    id: client.info.wid,
+                    number: client.info.wid.user,
+                    name: client.info.pushname,
+                    pushname: client.info.pushname,
+                    shortName: client.info.pushname,
+                    isMe: true,
+                    isUser: true,
+                    isGroup: false,
+                    isWAContact: true,
+                    isMyContact: false,
+                    isBlocked: false,
+                    formattedNumber: client.info.wid.user,
+                });
+            } else {
+                console.log("[getContacts] No 'isMe' contact found AND client.info isn't fully ready yet — skipping synthesis and skipping cache for this response.");
+                skipCache = true;
+            }
+        }
+
+        // Inyectar números del caché que no estaban en la agenda (autores de grupo
+        // resueltos por notifyName/getContactById) para que la app los encuentre
+        // en contactList con isMyContact=true y muestre su nombre real.
+        const existingIds = new Set(contactList.map(c => c.id?._serialized));
+        for (const [fullId, name] of contactNameCache.entries()) {
+            if (existingIds.has(fullId)) continue;
+            if (!fullId.includes("@")) continue; // entradas antiguas/legado sin dominio — ignorar
+            existingIds.add(fullId);
+            const [num, server] = fullId.split("@");
+            const shortName = name.split(" ")[0] || name;
             contactList.push({
-                id: client.info.wid,
-                number: client.info.wid.user,
-                name: client.info.pushname,
-                pushname: client.info.pushname,
-                shortName: client.info.pushname,
-                isMe: true,
-                isUser: true,
-                isGroup: false,
+                id: { _serialized: fullId, server: server, user: num },
+                number: num,
+                name: String(name),
+                shortName: String(shortName),
+                pushname: String(name),
+                isMyContact: true,
                 isWAContact: true,
-                isMyContact: false,
                 isBlocked: false,
-                formattedNumber: client.info.wid.user,
+                isMe: false,
+                formattedNumber: num
             });
         }
 
@@ -699,7 +739,11 @@ app.all("/getContacts", async (req, res) => {
 
         console.log(`[getContacts] Sending ${contactList.length} contacts. Has isMe: ${contactList.some(c => c.isMe)}`);
         const result = { contactList };
-        contactsCache.set("all", result);
+        if (!skipCache) {
+            contactsCache.set("all", result);
+        } else {
+            console.log("[getContacts] Not caching this response (client.info wasn't ready).");
+        }
         res.json(result);
     } catch (error) {
         console.error(`[getContacts] FAILED:`, error.message);
