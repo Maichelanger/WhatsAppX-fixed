@@ -742,11 +742,25 @@ app.all("/getContacts", async (req, res) => {
         // Inyectar números del caché que no estaban en la agenda (autores de grupo
         // resueltos por notifyName/getContactById) para que la app los encuentre
         // en contactList con isMyContact=true y muestre su nombre real.
+        //
+        // IMPORTANTE: la misma persona real puede aparecer aquí bajo un id
+        // distinto al de su contacto normal (su contacto ya guardado usa
+        // @c.us, pero lo aprendimos en un grupo/historia bajo su @lid). Por
+        // eso comprobamos también por NOMBRE, no solo por id exacto —
+        // si no, la misma persona sale duplicada en la lista.
         const existingIds = new Set(contactList.map(c => c.id?._serialized));
+        const existingNames = new Set(
+            contactList
+                .map(c => (c.name || c.pushname || "").trim().toLowerCase())
+                .filter(Boolean)
+        );
         for (const [fullId, name] of contactNameCache.entries()) {
             if (existingIds.has(fullId)) continue;
             if (!fullId.includes("@")) continue; // entradas antiguas/legado sin dominio — ignorar
+            const normalizedName = String(name).trim().toLowerCase();
+            if (normalizedName && existingNames.has(normalizedName)) continue;
             existingIds.add(fullId);
+            existingNames.add(normalizedName);
             const [num, server] = fullId.split("@");
             const shortName = name.split(" ")[0] || name;
             contactList.push({
@@ -763,7 +777,17 @@ app.all("/getContacts", async (req, res) => {
             });
         }
 
-        contactList.sort((a, b) => {
+        // Red de seguridad final: por si client.getContacts() devolviera
+        // alguna vez el mismo id dos veces.
+        const seenFinalIds = new Set();
+        const dedupedContactList = contactList.filter(c => {
+            const id = c.id?._serialized;
+            if (!id) return true;
+            if (seenFinalIds.has(id)) return false;
+            seenFinalIds.add(id);
+            return true;
+        });
+        dedupedContactList.sort((a, b) => {
             const nameA = (a.name || "").toLowerCase();
             const nameB = (b.name || "").toLowerCase();
             if (nameA < nameB) return -1;
@@ -771,9 +795,9 @@ app.all("/getContacts", async (req, res) => {
             return 0;
         });
 
-        console.log(`[getContacts] Sending ${contactList.length} contacts. Has isMe: ${contactList.some(c => c.isMe)}`);
-        const result = { contactList };
-        if (contactList.some(c => c.isMe)) {
+        console.log(`[getContacts] Sending ${dedupedContactList.length} contacts. Has isMe: ${dedupedContactList.some(c => c.isMe)}`);
+        const result = { contactList: dedupedContactList };
+        if (dedupedContactList.some(c => c.isMe)) {
             contactsCache.set("all", result);
         } else {
             console.log(`[getContacts] NOT caching — no isMe entry present (would lock in a broken response).`);
