@@ -55,7 +55,6 @@ const SERVER_CONFIG = require(configPath);
 
 let clients = [];
 let queueClients = [];
-let presences = {};
 let reInitializeCount = 1;
 
 const client = new Client({
@@ -102,8 +101,36 @@ const TOKENS = {
     CLIENT: "vC.I)Xsfe(;p4YB6E5@y"
 };
 
-// Utility functions
-const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+// Shared lookup helpers — every route that needs a chat/contact/message
+// follows the same "look it up, 404 cleanly if it's not there" pattern.
+// Centralizing it means one consistent error shape everywhere instead of
+// each route re-implementing (or forgetting) its own null-check.
+async function getChatOrFail(contactId, res, label = "Chat") {
+    const chat = await client.getChatById(contactId);
+    if (!chat) {
+        res.status(404).json({ error: `${label} not found` });
+        return null;
+    }
+    return chat;
+}
+
+async function getContactOrFail(contactId, res, label = "Contact") {
+    const contact = await client.getContactById(contactId);
+    if (!contact) {
+        res.status(404).json({ error: `${label} not found` });
+        return null;
+    }
+    return contact;
+}
+
+async function getMessageOrFail(messageId, res, label = "Message") {
+    const message = await client.getMessageById(messageId);
+    if (!message) {
+        res.status(404).json({ error: `${label} not found` });
+        return null;
+    }
+    return message;
+}
 
 function reconnect(socket) {
     console.log(`Attempting to reconnect with ${socket.name}`);
@@ -617,7 +644,8 @@ app.all("/getChats", async (req, res) => {
 app.post("/syncChat/:contactId", async (req, res) => {
     try {
         const contactId = buildContactId(req.params.contactId, req.query.isGroup == 1);
-        const chat = await client.getChatById(contactId);
+        const chat = await getChatOrFail(contactId, res);
+        if (!chat) return;
         chat.syncHistory();
         res.json({});
     } catch (error) {
@@ -823,11 +851,12 @@ app.all("/getGroups", async (req, res) => {
 
         const groupListPromises = groupChats.map(async (chat) => {
             const fullChat = await client.getChatById(chat.id._serialized);
+            if (!fullChat) return null;
             fullChat.groupDesc = fullChat.description;
             return fullChat;
         });
 
-        const groupList = await Promise.all(groupListPromises);
+        const groupList = (await Promise.all(groupListPromises)).filter(Boolean);
         res.json({ groupList });
     } catch (error) {
         res.status(500).send("Failed to get groups: " + error.message);
@@ -908,7 +937,8 @@ app.all("/getGroupImgHash/:id", async (req, res) => {
 
 app.all("/getGroupInfo/:id", async (req, res) => {
     try {
-        const chat = await client.getChatById(req.params.id + "@g.us");
+        const chat = await getChatOrFail(req.params.id + "@g.us", res);
+        if (!chat) return;
         chat.groupDesc = chat.description;
         res.json(chat);
     } catch (error) {
@@ -929,11 +959,8 @@ app.all("/getChatMessages/:contactId", async (req, res) => {
             return res.json(cached);
         }
 
-        const chat = await client.getChatById(contactId);
-        if (!chat) {
-            console.log("[getChatMessages] Chat not found/resolvable for:", contactId);
-            return res.status(404).json({ error: "Chat not found" });
-        }
+        const chat = await getChatOrFail(contactId, res);
+        if (!chat) return;
         const messages = await chat.fetchMessages({ limit });
 
         const filteredMessages = messages.filter(message => message.type !== "notification_template");
@@ -956,7 +983,8 @@ app.all("/getChatMessages/:contactId", async (req, res) => {
 app.post("/setTypingStatus/:contactId", async (req, res) => {
     try {
         const contactId = buildContactId(req.params.contactId, req.query.isGroup == 1);
-        const chat = await client.getChatById(contactId);
+        const chat = await getChatOrFail(contactId, res);
+        if (!chat) return;
 
         if (req.query.isVoiceNote == 1) {
             await chat.sendStateRecording();
@@ -973,7 +1001,8 @@ app.post("/setTypingStatus/:contactId", async (req, res) => {
 app.post("/clearState/:contactId", async (req, res) => {
     try {
         const contactId = buildContactId(req.params.contactId, req.query.isGroup == 1);
-        const chat = await client.getChatById(contactId);
+        const chat = await getChatOrFail(contactId, res);
+        if (!chat) return;
         await chat.clearState();
         res.json({});
     } catch (error) {
@@ -994,7 +1023,8 @@ app.post("/seenBroadcast/:messageId", async (req, res) => {
 app.all("/getAudioData/:audioId", async (req, res) => {
     try {
         const audioId = decodeURIComponent(req.params.audioId);
-        const message = await client.getMessageById(audioId);
+        const message = await getMessageOrFail(audioId, res);
+        if (!message) return;
         const media = await message.downloadMedia();
 
         if (media) {
@@ -1025,8 +1055,9 @@ app.all("/getAudioData/:audioId", async (req, res) => {
 app.all("/getDocument/:documentId", async (req, res) => {
     try {
         const documentId = decodeURIComponent(req.params.documentId);
-        const message = await client.getMessageById(documentId);
-        if (!message || !message.hasMedia) {
+        const message = await getMessageOrFail(documentId, res);
+        if (!message) return;
+        if (!message.hasMedia) {
             return res.status(404).send("Message not found or it has no media.");
         }
 
@@ -1050,7 +1081,8 @@ app.all("/getMediaData/:mediaId", async (req, res) => {
   console.log("Downloading media from ID");
   try {
     const messageId = decodeURIComponent(req.params.mediaId);
-    const message = await client.getMessageById(messageId);
+    const message = await getMessageOrFail(messageId, res);
+    if (!message) return;
     const media = await message.downloadMedia();
 
     if (!media) {
@@ -1116,9 +1148,10 @@ app.all("/getMediaData/:mediaId", async (req, res) => {
 app.all("/getVideoThumbnail/:mediaId", async (req, res) => {
     try {
         const messageId = decodeURIComponent(req.params.mediaId);
-        const message = await client.getMessageById(messageId);
+        const message = await getMessageOrFail(messageId, res);
+        if (!message) return;
 
-        if (message && message.type === "video") {
+        if (message.type === "video") {
             const media = await message.downloadMedia();
 
             if (media && media.mimetype.startsWith("video/")) {
@@ -1152,11 +1185,13 @@ app.all("/getVideoThumbnail/:mediaId", async (req, res) => {
 app.post("/sendMessage/:contactId", async (req, res) => {
     try {
         const contactId = buildContactId(req.params.contactId, req.query.isGroup == 1);
-        const chat = await client.getChatById(contactId);
+        const chat = await getChatOrFail(contactId, res);
+        if (!chat) return;
 
         if (req.body.messageText) {
             if (req.body.replyTo) {
-                const replyMessage = await client.getMessageById(req.body.replyTo);
+                const replyMessage = await getMessageOrFail(req.body.replyTo, res, "Reply target message");
+                if (!replyMessage) return;
                 await replyMessage.reply(req.body.messageText);
             } else {
                 await chat.sendMessage(req.body.messageText);
@@ -1212,7 +1247,8 @@ app.post("/sendMessage/:contactId", async (req, res) => {
 app.post("/setMute/:contactId/:muteLevel", async (req, res) => {
     try {
         const contactId = buildContactId(req.params.contactId, req.query.isGroup == 1);
-        const chat = await client.getChatById(contactId);
+        const chat = await getChatOrFail(contactId, res);
+        if (!chat) return;
         const muteLevel = parseInt(req.params.muteLevel);
 
         console.log(muteLevel);
@@ -1243,7 +1279,8 @@ app.post("/setMute/:contactId/:muteLevel", async (req, res) => {
 app.post("/setBlock/:contactId", async (req, res) => {
     try {
         const contactId = buildContactId(req.params.contactId, req.query.isGroup == 1);
-        const contact = await client.getContactById(contactId);
+        const contact = await getContactOrFail(contactId, res);
+        if (!contact) return;
 
         if (contact.isBlocked) {
             await contact.unblock();
@@ -1262,7 +1299,8 @@ app.post("/setBlock/:contactId", async (req, res) => {
 app.post("/deleteChat/:contactId", async (req, res) => {
     try {
         const contactId = buildContactId(req.params.contactId, req.query.isGroup == 1);
-        const chat = await client.getChatById(contactId);
+        const chat = await getChatOrFail(contactId, res);
+        if (!chat) return;
         await chat.delete();
         res.status(200).json({ response: "ok" });
     } catch (error) {
@@ -1281,11 +1319,8 @@ app.post("/readChat/:contactId", async (req, res) => {
         console.log("Contact:", rawId, "isGroup:", req.query.isGroup);
         console.log("Built ID:", contactId);
 
-        const chat = await client.getChatById(contactId);
-        if (!chat) {
-            console.log("Chat not found/resolvable for:", contactId);
-            return res.status(404).json({ error: "Chat not found" });
-        }
+        const chat = await getChatOrFail(contactId, res);
+        if (!chat) return;
         console.log("Unread count:", chat.unreadCount);
 
         if (chat.unreadCount > 0) {
@@ -1308,7 +1343,8 @@ app.post("/readChat/:contactId", async (req, res) => {
 app.post("/leaveGroup/:groupId", async (req, res) => {
     try {
         const groupId = req.params.groupId + "@g.us";
-        const chat = await client.getChatById(groupId);
+        const chat = await getChatOrFail(groupId, res);
+        if (!chat) return;
         await chat.leave();
         res.status(200).json({ response: "ok" });
     } catch (error) {
@@ -1321,11 +1357,8 @@ app.post("/leaveGroup/:groupId", async (req, res) => {
 app.all("/getQuotedMessage/:messageId", async (req, res) => {
     try {
         const messageId = decodeURIComponent(req.params.messageId);
-        const message = await client.getMessageById(messageId);
-
-        if (!message) {
-            return res.status(404).send("Message not found");
-        }
+        const message = await getMessageOrFail(messageId, res);
+        if (!message) return;
 
         if (message.hasQuotedMsg) {
             const quotedMessage = await message.getQuotedMessage();
@@ -1361,11 +1394,8 @@ app.post("/setStatusInfo/:statusMsg", async (req, res) => {
 app.post("/deleteMessage/:messageId/:everyone", async (req, res) => {
     try {
         const messageId = decodeURIComponent(req.params.messageId);
-        const message = await client.getMessageById(messageId);
-
-        if (!message) {
-            return res.status(404).send("Message not found");
-        }
+        const message = await getMessageOrFail(messageId, res);
+        if (!message) return;
 
         const deleteForEveryone = req.params.everyone == 2;
         const result = await message.delete(deleteForEveryone);
