@@ -155,10 +155,8 @@ async function processMessageForCaption(message) {
         message._data.caption = undefined;
     }
 
-    // Resolver nombre del autor para mostrar en burbujas de grupo.
-    // La app iOS lee el autor desde id.participant.user y desde el campo "author".
     if (message.author) {
-        const fullAuthorId = message.author; // puede ser @c.us o @lid — nunca lo reconstruyas
+        const fullAuthorId = message.author;
         const authorNum = fullAuthorId.split("@")[0];
         const authorServer = fullAuthorId.split("@")[1] || "c.us";
         const notifyName = (message._data && message._data.notifyName) ? message._data.notifyName : "";
@@ -174,6 +172,28 @@ async function processMessageForCaption(message) {
                 server: authorServer,
                 _serialized: fullAuthorId
             };
+        }
+
+        // The app's chat list reads lastMessage._data.author.user directly to
+        // find who sent the last group message. It bypasses our message.author
+        // field and hits the raw _data object instead. Normalize _data.author
+        // so its .user is the real phone number (after toPn translation),
+        // matching what's in contactList after our number normalization.
+        if (message._data && message._data.author) {
+            const rawAuthor = message._data.author;
+            if (typeof rawAuthor === 'object' && rawAuthor !== null) {
+                // Already an object — ensure .user is the phone-number portion
+                // (authorNum, extracted from the toPn-translated fullAuthorId)
+                rawAuthor.user = authorNum;
+                rawAuthor.server = authorServer;
+                rawAuthor._serialized = fullAuthorId;
+            } else if (typeof rawAuthor === 'string') {
+                message._data.author = {
+                    user: authorNum,
+                    server: authorServer,
+                    _serialized: fullAuthorId
+                };
+            }
         }
     }
 
@@ -437,14 +457,22 @@ client.on("ready", async () => {
         console.log(`[Cache] ${count} nombres de contacto listos.`);
 
         // Segunda pasada: resolver autores de grupo que no están en la agenda.
-        // IMPORTANTE: usamos el id COMPLETO de author (puede ser @c.us o @lid),
-        // nunca solo el número — reconstruir "numero@c.us" a partir de un id
-        // @lid produce un contacto inexistente, ya que el número de LID no es
-        // el número de teléfono real del contacto.
         client.getChats().then(async chats => {
             const groups = chats.filter(c => c.isGroup);
             const unknownAuthors = new Set();
             for (const group of groups) {
+                // Also populate phoneNumberToName for group participants
+                const participants = group.groupMetadata?.participants || [];
+                for (const p of participants) {
+                    if (!p.id || p.id.server !== 'c.us' || !p.id.user) continue;
+                    const phone = p.id.user;
+                    if (!phoneNumberToName.has(phone)) {
+                        const name = contactNameCache.get(p.id._serialized)
+                            || contactNameCache.get(`${phone}@c.us`);
+                        if (name) phoneNumberToName.set(phone, name);
+                    }
+                }
+
                 let msgs;
                 try { msgs = await group.fetchMessages({ limit: 50 }); }
                 catch (_) { continue; }
@@ -458,7 +486,15 @@ client.on("ready", async () => {
                 try {
                     const contact = await client.getContactById(fullAuthorId);
                     const name = contact?.name || contact?.pushname || "";
-                    if (name) { contactNameCache.set(fullAuthorId, name); added++; }
+                    if (name) {
+                        contactNameCache.set(fullAuthorId, name);
+                        // Also add to phoneNumberToName using the contact's real phone number
+                        const phone = contact?.id?.user;
+                        if (phone && contact?.id?.server === 'c.us') {
+                            phoneNumberToName.set(phone, name);
+                        }
+                        added++;
+                    }
                 } catch (_) { /* ignorar */ }
             }
             console.log(`[Cache] ${added} autores de grupo resueltos (de ${unknownAuthors.size} únicos).`);
@@ -537,6 +573,12 @@ const messagesCache = makeTTLCache();
 // cada mensaje nuevo. No bloquea ninguna petición ni hace llamadas
 // adicionales por mensaje.
 const contactNameCache = new Map();
+
+// Secondary cache keyed by real phone number (c.us user portion) → name.
+// Populated from group participant data (where we have the real phone numbers
+// after toPn translation) so that /getContacts synthetic injection can use
+// the correct phone number as the contact's number field rather than a LID.
+const phoneNumberToName = new Map();
 
 const CHATS_CACHE_TTL = 20 * 1000;       // chat list changes often — short TTL
 const CONTACTS_CACHE_TTL = 60 * 1000;    // shortened from 5 min — self-heals faster if anything is ever wrong
@@ -622,11 +664,26 @@ app.all("/getChats", async (req, res) => {
             chat.groupDesc = chat.description;
             return chat;
         });
+        // Build phone-number → name mappings from the translated participant ids
+        // so /getContacts can inject synthetic entries with correct phone numbers.
+        for (const group of groupList) {
+            const participants = group.groupMetadata?.participants || [];
+            for (const p of participants) {
+                if (!p.id || p.id.server !== 'c.us' || !p.id.user) continue;
+                const phone = p.id.user;
+                if (phoneNumberToName.has(phone)) continue;
+                // Look up name from contactNameCache (may be keyed by @lid or @c.us)
+                const name = contactNameCache.get(p.id._serialized)
+                    || contactNameCache.get(`${phone}@c.us`);
+                if (name) phoneNumberToName.set(phone, name);
+            }
+        }
         console.log(`[getChats] ${groupList.length} group chats included (no redundant re-fetch).`);
         console.log(`[getChats] Done. Sending response.`);
 
         const result = { chatList, groupList };
         chatsCache.set("all", result);
+        contactsCache.clear(); // rebuild contacts on next fetch to pick up new phoneNumberToName entries
         return result;
     })();
 
@@ -740,6 +797,9 @@ app.all("/getContacts", async (req, res) => {
                 }
                 const formattedNumber = await contact.getFormattedNumber();
                 contact.formattedNumber = formattedNumber;
+                if (contact.id?.user && contact.id?.server === 'c.us') {
+                    contact.number = contact.id.user;
+                }
                 return contact;
             } catch (err) {
                 console.error(`[getContacts] Failed processing contact ${contact.id?._serialized}: ${err.message}`);
@@ -767,41 +827,35 @@ app.all("/getContacts", async (req, res) => {
             });
         }
 
-        // Inyectar números del caché que no estaban en la agenda (autores de grupo
-        // resueltos por notifyName/getContactById) para que la app los encuentre
-        // en contactList con isMyContact=true y muestre su nombre real.
-        //
-        // IMPORTANTE: la misma persona real puede aparecer aquí bajo un id
-        // distinto al de su contacto normal (su contacto ya guardado usa
-        // @c.us, pero lo aprendimos en un grupo/historia bajo su @lid). Por
-        // eso comprobamos también por NOMBRE, no solo por id exacto —
-        // si no, la misma persona sale duplicada en la lista.
-        const existingIds = new Set(contactList.map(c => c.id?._serialized));
+        // Inject participants from groups who aren't in the saved contact list.
+        // Uses phoneNumberToName (keyed by real phone number, populated from
+        // group participants after toPn translation) so that the injected entry's
+        // number field is the real phone number — matching participant.id.user
+        // in the app's lookup logic.
+        const existingNumbers = new Set(contactList.map(c => c.number).filter(Boolean));
         const existingNames = new Set(
             contactList
                 .map(c => (c.name || c.pushname || "").trim().toLowerCase())
                 .filter(Boolean)
         );
-        for (const [fullId, name] of contactNameCache.entries()) {
-            if (existingIds.has(fullId)) continue;
-            if (!fullId.includes("@")) continue; // entradas antiguas/legado sin dominio — ignorar
+        for (const [phone, name] of phoneNumberToName.entries()) {
+            if (existingNumbers.has(phone)) continue;
             const normalizedName = String(name).trim().toLowerCase();
             if (normalizedName && existingNames.has(normalizedName)) continue;
-            existingIds.add(fullId);
+            existingNumbers.add(phone);
             existingNames.add(normalizedName);
-            const [num, server] = fullId.split("@");
             const shortName = name.split(" ")[0] || name;
             contactList.push({
-                id: { _serialized: fullId, server: server, user: num },
-                number: num,
+                id: { _serialized: `${phone}@c.us`, server: "c.us", user: phone },
+                number: phone,
                 name: String(name),
                 shortName: String(shortName),
                 pushname: String(name),
-                isMyContact: true,
+                isMyContact: false,
                 isWAContact: true,
                 isBlocked: false,
                 isMe: false,
-                formattedNumber: num
+                formattedNumber: phone
             });
         }
 
@@ -824,6 +878,8 @@ app.all("/getContacts", async (req, res) => {
         });
 
         console.log(`[getContacts] Sending ${dedupedContactList.length} contacts. Has isMe: ${dedupedContactList.some(c => c.isMe)}`);
+        const sampleContacts = dedupedContactList.slice(0, 3).map(c => ({ number: c.number, idUser: c.id?.user, idServer: c.id?.server }));
+        console.log(`[getContacts] Sample contact number/id fields (after normalization):`, JSON.stringify(sampleContacts));
         const result = { contactList: dedupedContactList };
         if (dedupedContactList.some(c => c.isMe)) {
             contactsCache.set("all", result);
