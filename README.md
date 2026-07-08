@@ -2,6 +2,7 @@
 <h1>WhatsAppX²</h1>
 
 fixed server for whatsappx, as the original server for whatsappx is broken
+
 This project is currently in beta. Please report bugs or ask for help in bag-xml’s Discord server -> `#whatsapp`. *(When reporting bugs or asking for help, please give **as much detail as you can.**)* yes this does apply its not a leftover
 
 </div>
