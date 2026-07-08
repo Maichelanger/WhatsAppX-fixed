@@ -1,24 +1,23 @@
 <div align="center">
-<img src="Xcode%20Project/WhatsApp%20Legacy/Images/logo_large.png" width=20% height=20%>
-<h1>WhatsAppX</h1>
+<h1>WhatsAppX²</h1>
 
-use whatsapp on your old iPhone i guess
-
-This project is currently in beta. Please report bugs or ask for help in bag-xml’s Discord server -> `#whatsapp`. *(When reporting bugs or asking for help, please give **as much detail as you can.**)*
+fixed server for whatsappx, as the original server for whatsappx is broken
+This project is currently in beta. Please report bugs or ask for help in bag-xml’s Discord server -> `#whatsapp`. *(When reporting bugs or asking for help, please give **as much detail as you can.**)* yes this does apply its not a leftover
 
 </div>
 
-## Compilation
+no compilation, Sorry !
 
-- Install Bun
-- Go to Server/ and run `bun build server.ts utils.ts chat.ts --compile`. Add build target & any other flags if needed.
-- Download FFmpeg from:
-  * Windows: https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl.zip
-  * macOS: https://evermeet.cx/ffmpeg/
-  * Linux: https://johnvansickle.com/ffmpeg/
-- Create `ffmpeg` folder in the folder that has the newly made executable
-- Move the previously downloaded `ffmpeg` and its dependencies into that `ffmpeg` folder
-- Run `server` and profit.
+# HOW TO GET IT TO WORK
+
+make sure you have ffmpeg added to path enviroment tables, the server installed, node.js and google chrome
+
+1. unzip the server
+2. modify the config.json file to have your google chrome path.
+3. open the cmd
+4. cd to where your server is
+5. type npm start
+6. profit
 
 (The Windows Phone version of the server is [here](https://github.com/lebao3105/WhatsAppX). The iOS version will use the server in this repository.)
 
@@ -75,7 +74,7 @@ This project is **not affiliated** with “WA for Legacy iOS” by Alwin Lubbers
 This is an **unofficial client** for WhatsApp and is **not affiliated with**, **endorsed by**, or **supported** by WhatsApp Inc. in any way.
 By using this application, you acknowledge and agree that:
 - **You** are **solely responsible** for the **use** of **your WhatsApp account** with this app.
-- **I** (calvink19) assume **no responsibility** for **any actions** taken by _WhatsApp Inc._ against your account, including (but not limited to) suspension, banning, or data loss.
+- **I** (newfuckingplayer) assume **no responsibility** for **any actions** taken by _WhatsApp Inc._ against your account, including (but not limited to) suspension, banning, or data loss.
 
 **Use at your own risk!**
 If you do not agree with these terms, **do not use this application.** A pop-up is also presented in the iOS application.
