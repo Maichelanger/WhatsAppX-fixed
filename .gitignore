@@ -1,0 +1,27 @@
+# --- WhatsApp session & auth  ---
+.wwebjs_auth/
+.wwebjs_cache/
+
+# --- Local machine-specific config (paths, ports specific to your PC) ---
+config.json
+
+# --- Dependencies ---
+node_modules/
+
+# --- Downloaded/temp media  ---
+tmp/
+temp/
+*.tmp
+
+# --- OS/editor cruft ---
+.DS_Store
+Thumbs.db
+.vscode/
+*.swp
+
+# --- Env files ---
+.env
+.env.local
+
+# --- Windows shortcuts ---
+*.lnk

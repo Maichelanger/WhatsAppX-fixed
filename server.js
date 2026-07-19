@@ -106,6 +106,11 @@ const TOKENS = {
 // Centralizing it means one consistent error shape everywhere instead of
 // each route re-implementing (or forgetting) its own null-check.
 async function getChatOrFail(contactId, res, label = "Chat") {
+    if (!contactId) {
+        console.warn(`[getChatOrFail] Received invalid/missing contactId (client sent a null/empty id).`);
+        res.status(400).json({ error: `${label} id missing or invalid` });
+        return null;
+    }
     const chat = await client.getChatById(contactId);
     if (!chat) {
         res.status(404).json({ error: `${label} not found` });
@@ -115,6 +120,11 @@ async function getChatOrFail(contactId, res, label = "Chat") {
 }
 
 async function getContactOrFail(contactId, res, label = "Contact") {
+    if (!contactId) {
+        console.warn(`[getContactOrFail] Received invalid/missing contactId (client sent a null/empty id).`);
+        res.status(400).json({ error: `${label} id missing or invalid` });
+        return null;
+    }
     const contact = await client.getContactById(contactId);
     if (!contact) {
         res.status(404).json({ error: `${label} not found` });
@@ -124,6 +134,11 @@ async function getContactOrFail(contactId, res, label = "Contact") {
 }
 
 async function getMessageOrFail(messageId, res, label = "Message") {
+    if (!messageId) {
+        console.warn(`[getMessageOrFail] Received invalid/missing messageId.`);
+        res.status(400).json({ error: `${label} id missing or invalid` });
+        return null;
+    }
     const message = await client.getMessageById(messageId);
     if (!message) {
         res.status(404).json({ error: `${label} not found` });
@@ -145,7 +160,16 @@ function reconnect(socket) {
 }
 
 function buildContactId(id, isGroup = false) {
-    return id + (isGroup ? "@g.us" : "@c.us");
+    if (id === null || id === undefined) return null;
+    const str = String(id).trim();
+    // Guards against a client sending a stringified nil instead of an actual
+    // id — e.g. Objective-C's "%@" format specifier renders a nil object as
+    // the literal text "(null)", and some JS/Swift bridges produce "null" or
+    // "undefined" the same way.
+    if (str === "" || str === "null" || str === "(null)" || str === "undefined") {
+        return null;
+    }
+    return str + (isGroup ? "@g.us" : "@c.us");
 }
 
 async function processMessageForCaption(message) {
@@ -436,6 +460,20 @@ client.on("ready", async () => {
     global.loggedin = 1;
     console.log("Server A and B are ready.");
     console.log(`[ready] client.info = ${JSON.stringify(client.info)}`);
+
+    // Forward the headless browser's own console output (page-side
+    // console.log/warn/error, e.g. from the injected WWebJS helpers) into
+    // this Node process's stdout, since it's otherwise invisible.
+    if (client.pupPage && !client.pupPage.__consoleForwarded) {
+        client.pupPage.__consoleForwarded = true;
+        client.pupPage.on("console", (msg) => {
+            const type = msg.type();
+            if (type === "error" || type === "warning") {
+                console.log(`[page:${type}] ${msg.text()}`);
+            }
+        });
+    }
+
     try {
         const chats = await client.getChats();
         console.log(`[ready] client.getChats() immediately after ready: ${chats.length} chats found`);
@@ -654,6 +692,19 @@ app.all("/getChats", async (req, res) => {
 
         const chatList = await Promise.all(chatsWithMessages.map(processLastMessageCaption));
         console.log(`[getChats] Processed captions for ${chatList.length} chats`);
+
+        // TEMP DIAGNOSTIC: confirm lastMessage previews are resolving to
+        // real content types. Safe to remove once confirmed fixed.
+        console.log(
+            `[getChats] lastMessage summary:`,
+            JSON.stringify(
+                chatList.map(c => ({
+                    id: c.id?.user || c.id?._serialized,
+                    lastMsgType: c.lastMessage?.type ?? "(NONE)",
+                    lastMsgBody: (c.lastMessage?.body ?? "").slice(0, 20),
+                })),
+            ),
+        );
 
         // groupMetadata/description are already fully resolved for every
         // group inside client.getChats() itself (getChatModel does this
@@ -1019,8 +1070,49 @@ app.all("/getChatMessages/:contactId", async (req, res) => {
         if (!chat) return;
         const messages = await chat.fetchMessages({ limit });
 
-        const filteredMessages = messages.filter(message => message.type !== "notification_template");
+        // Message types that carry no real user-facing content — WhatsApp's
+        // own protocol/system bookkeeping (undecryptable "ciphertext"
+        // placeholders, e2e session notices, group-protocol messages,
+        // HSM/debug frames, etc). The iOS client has no renderer for these,
+        // so drop them here rather than let them show up as a confusing
+        // "not compatible" placeholder. Keep this in sync with
+        // WWebJS.NO_CONTENT_MESSAGE_TYPES in Injected/Utils.js.
+        const NO_CONTENT_MESSAGE_TYPES = [
+            "ciphertext",
+            "notification_template",
+            "e2e_notification",
+            "gp2",
+            "protocol",
+            "debug",
+            "hsm",
+            "notification",
+            "call_log",
+        ];
+        const filteredMessages = messages
+            .filter(message => !NO_CONTENT_MESSAGE_TYPES.includes(message.type))
+            // WhatsApp's local store can backfill an older message into the
+            // chat's message collection out of chronological order (e.g. a
+            // previously-undecryptable message that resolves later, or one
+            // loaded in from history). Sort explicitly by timestamp instead
+            // of trusting insertion order, so it doesn't appear at the
+            // bottom of the chat despite showing an older date.
+            .sort((a, b) => (a.timestamp ?? 0) - (b.timestamp ?? 0));
         const processedMessages = await Promise.all(filteredMessages.map(processMessageForCaption));
+
+        // TEMP DIAGNOSTIC: confirm sort order and catch any message with a
+        // missing/broken id or timestamp. Safe to remove once the ordering
+        // issue is confirmed fixed.
+        console.log(
+            `[getChatMessages] ${contactId} last 5 after sort:`,
+            JSON.stringify(
+                processedMessages.slice(-5).map(m => ({
+                    id: m.id?._serialized || "(MISSING)",
+                    type: m.type,
+                    timestamp: m.timestamp,
+                    date: m.timestamp ? new Date(m.timestamp * 1000).toISOString() : "(NONE)",
+                })),
+            ),
+        );
 
         const result = {
             chatMessages: processedMessages,
@@ -1134,9 +1226,11 @@ app.all("/getDocument/:documentId", async (req, res) => {
 });
 
 app.all("/getMediaData/:mediaId", async (req, res) => {
-  console.log("Downloading media from ID");
+  const messageId = decodeURIComponent(req.params.mediaId);
+  console.log(
+    `Downloading media from ID. raw="${req.params.mediaId}" decoded="${messageId}" parts=${messageId.split("_").length}`,
+  );
   try {
-    const messageId = decodeURIComponent(req.params.mediaId);
     const message = await getMessageOrFail(messageId, res);
     if (!message) return;
     const media = await message.downloadMedia();
